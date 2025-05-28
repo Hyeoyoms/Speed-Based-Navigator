@@ -7,7 +7,9 @@ SpeedNavigator = {
     enable_debug_prints = false, -- User toggle for verbose logging (original script feature)
     last_known_match_index = -1, -- Stores the index of the last found action (1-based)
     last_script_id_searched = nil, -- Stores the ID of the script last searched
-    scan_from_current_timeline = false -- User toggle for scanning from current timeline
+    scan_from_current_timeline = false, -- User toggle for scanning from current timeline
+    timeline_last_found_at_s = nil, -- Stores the 'at' time of the last segment found via timeline scan
+    timeline_last_found_action_idx = nil -- Stores the action index of the last segment found via timeline scan
 }
 
 function init()
@@ -30,7 +32,14 @@ function gui()
     SpeedNavigator.enable_debug_prints = ofs.Checkbox("Enable Debug Prints", SpeedNavigator.enable_debug_prints)
     ofs.Tooltip("Show detailed processing logs in the OFS console.")
 
+    local prev_scan_from_timeline = SpeedNavigator.scan_from_current_timeline
     SpeedNavigator.scan_from_current_timeline = ofs.Checkbox("Scan from current timeline", SpeedNavigator.scan_from_current_timeline)
+    if prev_scan_from_timeline ~= SpeedNavigator.scan_from_current_timeline then
+        -- Reset timeline specific state if the mode is toggled
+        SpeedNavigator.timeline_last_found_at_s = nil
+        SpeedNavigator.timeline_last_found_action_idx = nil
+        if SpeedNavigator.enable_debug_prints then print("Timeline scan mode toggled. Resetting timeline state.") end
+    end
     ofs.Tooltip("If checked, scanning will start from the current video player timeline.\nIf unchecked, scanning will start from the beginning or after the last found position.")
 
     ofs.Separator()
@@ -80,19 +89,42 @@ function Execute_FindAndNavigate()
 
     if use_timeline_scan_logic then
         local current_player_time_s = player.CurrentTime()
-        if SpeedNavigator.enable_debug_prints then print(string.format("Scan from current timeline enabled. Player time: %.3fs", current_player_time_s)) end
-
         local timeline_scan_start_index = 1
-        for i = 1, num_actions do
-            if actions[i].at >= current_player_time_s then
-                timeline_scan_start_index = i
-                break
+
+        if SpeedNavigator.timeline_last_found_at_s ~= nil and
+           SpeedNavigator.timeline_last_found_action_idx ~= nil and
+           math.abs(current_player_time_s - SpeedNavigator.timeline_last_found_at_s) < 0.01 and -- Check if player time is (almost) the same as last found
+           SpeedNavigator.timeline_last_found_action_idx < num_actions -1 then -- Ensure there's a next action to scan from
+            
+            timeline_scan_start_index = SpeedNavigator.timeline_last_found_action_idx + 1
+            if SpeedNavigator.enable_debug_prints then
+                print(string.format("Timeline scan: Resuming from index %d (after last found at %.3fs, action idx %d). Current player time: %.3fs",
+                    timeline_scan_start_index, SpeedNavigator.timeline_last_found_at_s, SpeedNavigator.timeline_last_found_action_idx, current_player_time_s))
             end
-            if i == num_actions then
-                timeline_scan_start_index = num_actions
+        else
+            -- Player time has changed, or no previous timeline find, or at the end of actions: reset and find from current player time
+            if SpeedNavigator.enable_debug_prints then
+                if SpeedNavigator.timeline_last_found_at_s == nil then
+                    print(string.format("Timeline scan: Starting fresh. Player time: %.3fs", current_player_time_s))
+                else
+                    print(string.format("Timeline scan: Player time (%.3fs) differs from last found (%.3fs) or other condition. Resetting. Last action idx: %s",
+                        current_player_time_s, SpeedNavigator.timeline_last_found_at_s or -1, SpeedNavigator.timeline_last_found_action_idx or "nil"))
+                end
             end
+            SpeedNavigator.timeline_last_found_at_s = nil
+            SpeedNavigator.timeline_last_found_action_idx = nil
+
+            for i = 1, num_actions do
+                if actions[i].at >= current_player_time_s then
+                    timeline_scan_start_index = i
+                    break
+                end
+                if i == num_actions then
+                    timeline_scan_start_index = num_actions
+                end
+            end
+            if SpeedNavigator.enable_debug_prints then print(string.format("Timeline scan: Determined start index %d from player time %.3fs", timeline_scan_start_index, current_player_time_s)) end
         end
-        if SpeedNavigator.enable_debug_prints then print(string.format("Timeline scan: Starting from action index %d (time: %.3fs)", timeline_scan_start_index, actions[timeline_scan_start_index].at)) end
         
         local current_search_start_idx = timeline_scan_start_index
         if current_search_start_idx > num_actions -1 then current_search_start_idx = num_actions -1 end
@@ -313,17 +345,31 @@ function Execute_FindAndNavigate()
     SpeedNavigator.last_script_id_searched = current_script_id
 
     if search_occurred_and_found and found_action_at_s_for_seek ~= nil and p1_action_index_of_match ~= -1 then
-        if not use_timeline_scan_logic then -- Only update last_known_match_index if not using timeline scan
+        local seek_target_s = found_action_at_s_for_seek
+        player.Seek(seek_target_s) -- Seek first
+
+        if use_timeline_scan_logic then
+            SpeedNavigator.timeline_last_found_at_s = seek_target_s -- Store the actual time we jumped to
+            SpeedNavigator.timeline_last_found_action_idx = p1_action_index_of_match
+            if SpeedNavigator.enable_debug_prints then
+                print(string.format("Timeline scan: Stored last found at %.3fs, action index %d", seek_target_s, p1_action_index_of_match))
+            end
+        else
             SpeedNavigator.last_known_match_index = p1_action_index_of_match
         end
-        local seek_target_s = found_action_at_s_for_seek
-        player.Seek(seek_target_s)
+        
         local found_at_ms_display = seek_target_s * 1000
         SpeedNavigator.status_message = string.format("Found: %s at %.3fs (%.0fms) (Action Index: %d). Jumped.", found_speed_info, seek_target_s, found_at_ms_display, p1_action_index_of_match)
     else
-        if not use_timeline_scan_logic then -- Only reset last_known_match_index if not using timeline scan
-            SpeedNavigator.last_known_match_index = -1 -- Reset if no new match found
+        if use_timeline_scan_logic then
+            -- If timeline scan found nothing, reset its state so next timeline scan starts fresh from player time
+            SpeedNavigator.timeline_last_found_at_s = nil
+            SpeedNavigator.timeline_last_found_action_idx = nil
+            if SpeedNavigator.enable_debug_prints then print("Timeline scan: No match found, resetting timeline state.") end
+        else
+            SpeedNavigator.last_known_match_index = -1 -- Reset if no new match found for default scan
         end
+
         if type(found_action_at_s_for_seek) ~= "number" and found_action_at_s_for_seek ~= nil then
              SpeedNavigator.status_message = "Error: Calculated seek time is not a valid number."
         else
