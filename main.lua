@@ -93,7 +93,7 @@ function Execute_FindAndNavigate()
 
         if SpeedNavigator.timeline_last_found_at_s ~= nil and
            SpeedNavigator.timeline_last_found_action_idx ~= nil and
-           math.abs(current_player_time_s - SpeedNavigator.timeline_last_found_at_s) < 0.01 and -- Check if player time is (almost) the same as last found
+           math.abs(current_player_time_s - SpeedNavigator.timeline_last_found_at_s) < 0.05 and -- Increased tolerance to 50ms
            SpeedNavigator.timeline_last_found_action_idx < num_actions -1 then -- Ensure there's a next action to scan from
             
             timeline_scan_start_index = SpeedNavigator.timeline_last_found_action_idx + 1
