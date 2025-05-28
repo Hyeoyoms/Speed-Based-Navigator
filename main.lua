@@ -6,7 +6,8 @@ SpeedNavigator = {
     status_message = "",
     enable_debug_prints = false, -- User toggle for verbose logging (original script feature)
     last_known_match_index = -1, -- Stores the index of the last found action (1-based)
-    last_script_id_searched = nil -- Stores the ID of the script last searched
+    last_script_id_searched = nil, -- Stores the ID of the script last searched
+    scan_from_current_timeline = false -- User toggle for scanning from current timeline
 }
 
 function init()
@@ -28,6 +29,9 @@ function gui()
 
     SpeedNavigator.enable_debug_prints = ofs.Checkbox("Enable Debug Prints", SpeedNavigator.enable_debug_prints)
     ofs.Tooltip("Show detailed processing logs in the OFS console.")
+
+    SpeedNavigator.scan_from_current_timeline = ofs.Checkbox("Scan from current timeline", SpeedNavigator.scan_from_current_timeline)
+    ofs.Tooltip("If checked, scanning will start from the current video player timeline.\nIf unchecked, scanning will start from the beginning or after the last found position.")
 
     ofs.Separator()
 
@@ -62,60 +66,46 @@ function Execute_FindAndNavigate()
     local p1_action_index_of_match = -1 -- Stores the index of p1 for the matched segment in the current search
 
     local start_index_for_search = 1
-    if SpeedNavigator.last_script_id_searched == current_script_id and
-       SpeedNavigator.last_known_match_index > 0 and
-       SpeedNavigator.last_known_match_index < num_actions then
-        start_index_for_search = SpeedNavigator.last_known_match_index + 1
-    else
-        SpeedNavigator.last_known_match_index = -1 -- Reset if different script or invalid previous index
-    end
-
     local search_occurred_and_found = false
+    local initial_scan_from_timeline_done = false -- Flag to indicate if the first scan from timeline is done
 
-    -- First search attempt: from start_index_for_search to the end of the script
-    for i = start_index_for_search, num_actions - 1 do
-        local p1 = actions[i]
-        local p2 = actions[i+1]
-
-        if p1 == nil or type(p1.pos) ~= "number" or type(p1.at) ~= "number" or
-           p2 == nil or type(p2.pos) ~= "number" or type(p2.at) ~= "number" then
-            goto continue_loop_primary
+    local use_timeline_scan_logic = SpeedNavigator.scan_from_current_timeline
+    if use_timeline_scan_logic then
+        if player == nil or type(player.CurrentTime) ~= "function" then
+            if SpeedNavigator.enable_debug_prints then print("Player or player.CurrentTime() not available. Disabling timeline scan for this attempt.") end
+            use_timeline_scan_logic = false -- Fallback to default search
+            SpeedNavigator.status_message = "Warning: Player not ready for timeline scan. Used default scan."
         end
-        
-        local p1_time_at_s = p1.at
-        local p2_time_at_s = p2.at
-        local time_diff_s = p2_time_at_s - p1_time_at_s
-
-        if time_diff_s <= 0 then
-            goto continue_loop_primary
-        end
-
-        local distance = math.abs(p2.pos - p1.pos)
-        local current_speed_units_per_sec = distance / time_diff_s
-
-        local is_slower_than_min = (SpeedNavigator.min_speed > 0) and (current_speed_units_per_sec < SpeedNavigator.min_speed) and (current_speed_units_per_sec > 0.00001)
-        local is_faster_than_max = (SpeedNavigator.max_speed > 0) and (current_speed_units_per_sec > SpeedNavigator.max_speed)
-
-        if is_slower_than_min or is_faster_than_max then
-            found_action_at_s_for_seek = p1_time_at_s
-            p1_action_index_of_match = i
-            found_speed_info = string.format("%.2f units/s", current_speed_units_per_sec)
-            search_occurred_and_found = true
-            break
-        end
-        ::continue_loop_primary::
     end
 
-    -- Second search attempt (wrap around): from the beginning to start_index_for_search - 1
-    if not search_occurred_and_found and start_index_for_search > 1 then
-        if SpeedNavigator.enable_debug_prints then print("Wrapping search to beginning...") end
-        for i = 1, start_index_for_search - 1 do
+    if use_timeline_scan_logic then
+        local current_player_time_s = player.CurrentTime()
+        if SpeedNavigator.enable_debug_prints then print(string.format("Scan from current timeline enabled. Player time: %.3fs", current_player_time_s)) end
+
+        local timeline_scan_start_index = 1
+        for i = 1, num_actions do
+            if actions[i].at >= current_player_time_s then
+                timeline_scan_start_index = i
+                break
+            end
+            if i == num_actions then
+                timeline_scan_start_index = num_actions
+            end
+        end
+        if SpeedNavigator.enable_debug_prints then print(string.format("Timeline scan: Starting from action index %d (time: %.3fs)", timeline_scan_start_index, actions[timeline_scan_start_index].at)) end
+        
+        local current_search_start_idx = timeline_scan_start_index
+        if current_search_start_idx > num_actions -1 then current_search_start_idx = num_actions -1 end
+        if current_search_start_idx < 1 then current_search_start_idx = 1 end
+
+        -- First scan (timeline): from current_search_start_idx to end
+        for i = current_search_start_idx, num_actions - 1 do
             local p1 = actions[i]
             local p2 = actions[i+1]
 
             if p1 == nil or type(p1.pos) ~= "number" or type(p1.at) ~= "number" or
                p2 == nil or type(p2.pos) ~= "number" or type(p2.at) ~= "number" then
-                goto continue_loop_wrap
+                goto continue_loop_timeline_primary
             end
             
             local p1_time_at_s = p1.at
@@ -123,7 +113,7 @@ function Execute_FindAndNavigate()
             local time_diff_s = p2_time_at_s - p1_time_at_s
 
             if time_diff_s <= 0 then
-                goto continue_loop_wrap
+                goto continue_loop_timeline_primary
             end
 
             local distance = math.abs(p2.pos - p1.pos)
@@ -139,20 +129,201 @@ function Execute_FindAndNavigate()
                 search_occurred_and_found = true
                 break
             end
-            ::continue_loop_wrap::
+            ::continue_loop_timeline_primary::
+        end
+        initial_scan_from_timeline_done = true
+    end
+
+    -- Standard search logic (or fallback/wrap-around for timeline search)
+    if not search_occurred_and_found then
+        if use_timeline_scan_logic and initial_scan_from_timeline_done then
+            -- This is the wrap-around part for "scan_from_current_timeline"
+            if SpeedNavigator.enable_debug_prints then print("Timeline scan: Wrapping search to beginning until original timeline start...") end
+            local timeline_wrap_end_index = 1
+            
+            local current_player_time_s_for_timeline_wrap
+            if player == nil or type(player.CurrentTime) ~= "function" then
+                 if SpeedNavigator.enable_debug_prints then print("Player or player.CurrentTime() not available for timeline wrap. Defaulting to full wrap before timeline_scan_start_index.") end
+                 local temp_timeline_start_idx_for_fallback = 1
+                 -- Attempt to get current time again for fallback. If still nil, this part won't be accurate.
+                 local fallback_player_time_s = nil
+                 if player and type(player.CurrentTime) == "function" then
+                    fallback_player_time_s = player.CurrentTime()
+                 end
+
+                 if fallback_player_time_s then
+                    for k_idx = 1, num_actions do
+                        if actions[k_idx].at >= fallback_player_time_s then
+                            temp_timeline_start_idx_for_fallback = k_idx
+                            break
+                        end
+                        if k_idx == num_actions then temp_timeline_start_idx_for_fallback = num_actions end
+                    end
+                 else
+                    -- If player.CurrentTime() is still not available, we can't accurately determine the wrap end point based on current time.
+                    -- As a last resort, wrap up to the originally calculated timeline_scan_start_index (which itself might be 1 if player.CurrentTime failed initially).
+                    -- This requires timeline_scan_start_index to be accessible here.
+                    -- For simplicity in this diff, let's assume if player.CurrentTime fails here, we make wrap empty or up to num_actions-1.
+                    -- A more robust solution would pass the initial current_player_time_s or timeline_scan_start_index.
+                    -- Given the current structure, if player.CurrentTime fails here, the wrap will be less precise.
+                    if SpeedNavigator.enable_debug_prints then print("Cannot determine precise wrap end due to player.CurrentTime() failure. Wrapping up to num_actions-1 or 0.") end
+                    -- Defaulting to a safe, potentially full wrap if time is unavailable.
+                    -- This could be improved by passing the initial current_player_time_s.
+                    -- For now, let's make it wrap up to num_actions -1 if player time is unavailable.
+                    temp_timeline_start_idx_for_fallback = num_actions -- This will make end_index num_actions -1
+                 end
+                 timeline_wrap_end_index = temp_timeline_start_idx_for_fallback -1
+                 if timeline_wrap_end_index < 0 then timeline_wrap_end_index = 0 end
+            else
+                current_player_time_s_for_timeline_wrap = player.CurrentTime()
+                if SpeedNavigator.enable_debug_prints then print(string.format("Timeline wrap: Player time for end index: %.3fs", current_player_time_s_for_timeline_wrap)) end
+                for k_idx = 1, num_actions do
+                    if actions[k_idx].at >= current_player_time_s_for_timeline_wrap then
+                        timeline_wrap_end_index = k_idx -1
+                        break
+                    end
+                     if k_idx == num_actions then
+                        timeline_wrap_end_index = num_actions -1
+                    end
+                end
+            end
+
+            if timeline_wrap_end_index < 1 then timeline_wrap_end_index = 0 end -- Allow empty loop if needed
+            if SpeedNavigator.enable_debug_prints then print(string.format("Timeline wrap: Scanning from index 1 to %d", timeline_wrap_end_index)) end
+
+            for i = 1, timeline_wrap_end_index do
+                 if i >= num_actions then break end -- ensure p2 is valid
+                local p1 = actions[i]
+                local p2 = actions[i+1]
+
+                if p1 == nil or type(p1.pos) ~= "number" or type(p1.at) ~= "number" or
+                   p2 == nil or type(p2.pos) ~= "number" or type(p2.at) ~= "number" then
+                    goto continue_loop_timeline_wrap
+                end
+                
+                local p1_time_at_s = p1.at
+                local p2_time_at_s = p2.at
+                local time_diff_s = p2_time_at_s - p1_time_at_s
+
+                if time_diff_s <= 0 then
+                    goto continue_loop_timeline_wrap
+                end
+
+                local distance = math.abs(p2.pos - p1.pos)
+                local current_speed_units_per_sec = distance / time_diff_s
+
+                local is_slower_than_min = (SpeedNavigator.min_speed > 0) and (current_speed_units_per_sec < SpeedNavigator.min_speed) and (current_speed_units_per_sec > 0.00001)
+                local is_faster_than_max = (SpeedNavigator.max_speed > 0) and (current_speed_units_per_sec > SpeedNavigator.max_speed)
+
+                if is_slower_than_min or is_faster_than_max then
+                    found_action_at_s_for_seek = p1_time_at_s
+                    p1_action_index_of_match = i
+                    found_speed_info = string.format("%.2f units/s", current_speed_units_per_sec)
+                    search_occurred_and_found = true
+                    break
+                end
+                ::continue_loop_timeline_wrap::
+            end
+
+        elseif not use_timeline_scan_logic then -- Covers both original "false" and fallback from "true"
+             -- This is the original default search logic
+            if SpeedNavigator.last_script_id_searched == current_script_id and
+               SpeedNavigator.last_known_match_index > 0 and
+               SpeedNavigator.last_known_match_index < num_actions then
+                start_index_for_search = SpeedNavigator.last_known_match_index + 1
+            else
+                SpeedNavigator.last_known_match_index = -1
+                start_index_for_search = 1
+            end
+            if SpeedNavigator.enable_debug_prints then print(string.format("Standard search: Starting from index %d", start_index_for_search)) end
+
+            -- First search attempt: from start_index_for_search to the end of the script
+            for i = start_index_for_search, num_actions - 1 do
+                local p1 = actions[i]
+                local p2 = actions[i+1]
+
+                if p1 == nil or type(p1.pos) ~= "number" or type(p1.at) ~= "number" or
+                   p2 == nil or type(p2.pos) ~= "number" or type(p2.at) ~= "number" then
+                    goto continue_loop_primary_default
+                end
+                
+                local p1_time_at_s = p1.at
+                local p2_time_at_s = p2.at
+                local time_diff_s = p2_time_at_s - p1_time_at_s
+
+                if time_diff_s <= 0 then
+                    goto continue_loop_primary_default
+                end
+
+                local distance = math.abs(p2.pos - p1.pos)
+                local current_speed_units_per_sec = distance / time_diff_s
+
+                local is_slower_than_min = (SpeedNavigator.min_speed > 0) and (current_speed_units_per_sec < SpeedNavigator.min_speed) and (current_speed_units_per_sec > 0.00001)
+                local is_faster_than_max = (SpeedNavigator.max_speed > 0) and (current_speed_units_per_sec > SpeedNavigator.max_speed)
+
+                if is_slower_than_min or is_faster_than_max then
+                    found_action_at_s_for_seek = p1_time_at_s
+                    p1_action_index_of_match = i
+                    found_speed_info = string.format("%.2f units/s", current_speed_units_per_sec)
+                    search_occurred_and_found = true
+                    break
+                end
+                ::continue_loop_primary_default::
+            end
+
+            -- Second search attempt (wrap around): from the beginning to start_index_for_search - 1
+            if not search_occurred_and_found and start_index_for_search > 1 then
+                if SpeedNavigator.enable_debug_prints then print("Standard search: Wrapping search to beginning...") end
+                for i = 1, start_index_for_search - 1 do
+                    local p1 = actions[i]
+                    local p2 = actions[i+1]
+
+                    if p1 == nil or type(p1.pos) ~= "number" or type(p1.at) ~= "number" or
+                       p2 == nil or type(p2.pos) ~= "number" or type(p2.at) ~= "number" then
+                        goto continue_loop_wrap_default
+                    end
+                    
+                    local p1_time_at_s = p1.at
+                    local p2_time_at_s = p2.at
+                    local time_diff_s = p2_time_at_s - p1_time_at_s
+
+                    if time_diff_s <= 0 then
+                        goto continue_loop_wrap_default
+                    end
+
+                    local distance = math.abs(p2.pos - p1.pos)
+                    local current_speed_units_per_sec = distance / time_diff_s
+
+                    local is_slower_than_min = (SpeedNavigator.min_speed > 0) and (current_speed_units_per_sec < SpeedNavigator.min_speed) and (current_speed_units_per_sec > 0.00001)
+                    local is_faster_than_max = (SpeedNavigator.max_speed > 0) and (current_speed_units_per_sec > SpeedNavigator.max_speed)
+
+                    if is_slower_than_min or is_faster_than_max then
+                        found_action_at_s_for_seek = p1_time_at_s
+                        p1_action_index_of_match = i
+                        found_speed_info = string.format("%.2f units/s", current_speed_units_per_sec)
+                        search_occurred_and_found = true
+                        break
+                    end
+                    ::continue_loop_wrap_default::
+                end
+            end
         end
     end
 
     SpeedNavigator.last_script_id_searched = current_script_id
 
     if search_occurred_and_found and found_action_at_s_for_seek ~= nil and p1_action_index_of_match ~= -1 then
-        SpeedNavigator.last_known_match_index = p1_action_index_of_match
+        if not use_timeline_scan_logic then -- Only update last_known_match_index if not using timeline scan
+            SpeedNavigator.last_known_match_index = p1_action_index_of_match
+        end
         local seek_target_s = found_action_at_s_for_seek
         player.Seek(seek_target_s)
         local found_at_ms_display = seek_target_s * 1000
         SpeedNavigator.status_message = string.format("Found: %s at %.3fs (%.0fms) (Action Index: %d). Jumped.", found_speed_info, seek_target_s, found_at_ms_display, p1_action_index_of_match)
     else
-        SpeedNavigator.last_known_match_index = -1 -- Reset if no new match found
+        if not use_timeline_scan_logic then -- Only reset last_known_match_index if not using timeline scan
+            SpeedNavigator.last_known_match_index = -1 -- Reset if no new match found
+        end
         if type(found_action_at_s_for_seek) ~= "number" and found_action_at_s_for_seek ~= nil then
              SpeedNavigator.status_message = "Error: Calculated seek time is not a valid number."
         else
